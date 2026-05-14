@@ -1,0 +1,11 @@
+.streamlit/secrets.toml
+.scalp_creds.json
+__pycache__/
+*.pyc
+*.env
+.env
+*.csv
+*.log
+.DS_Store
+.vscode/
+.idea/
