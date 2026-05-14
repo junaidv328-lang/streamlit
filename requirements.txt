@@ -1,0 +1,8 @@
+streamlit>=1.30
+pandas
+numpy
+plotly
+scipy
+pyotp
+smartapi-python
+streamlit-autorefresh
