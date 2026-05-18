@@ -1,0 +1,24 @@
+# Streamlit secrets — NEVER commit these
+.streamlit/secrets.toml
+.scalp_creds.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local data
+*.csv
+*.log
