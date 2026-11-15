@@ -334,6 +334,10 @@ INTERVAL_MAP = {
 SYMBOL_TOKEN_MAP = {
     "NIFTY 50":   ("NSE", "99926000", "NSE"),
     "BANKNIFTY":  ("NSE", "99926009", "NSE"),
+    "SENSEX":     ("BSE", "99919000", "BSE"),
+    "INDIA VIX":  ("NSE", "99926017", "NSE"),
+    # MCX futures token rolls every month → resolved at runtime
+    "CRUDEOIL":   ("MCX", None,       "MCX"),
     "RELIANCE":   ("NSE", "2885",     "NSE"),
     "INFY":       ("NSE", "1594",     "NSE"),
     "TCS":        ("NSE", "11536",    "NSE"),
@@ -343,6 +347,106 @@ SYMBOL_TOKEN_MAP = {
     "ADANIENT":   ("NSE", "25",       "NSE"),
     "TATAMOTORS": ("NSE", "3456",     "NSE"),
 }
+
+# Trading-session hours per exchange (IST). MCX evening session runs to
+# 23:30 (US summer) / 23:55 (US winter) — we use the later one, asking
+# for minutes past the close is harmless.
+SESSION_HOURS = {
+    "NSE": ((9, 15), (15, 30)),
+    "BSE": ((9, 15), (15, 30)),
+    "MCX": ((9, 0),  (23, 55)),
+}
+
+# Default Market Profile row size per symbol
+DEFAULT_TPO_TICK = {
+    "NIFTY 50": 5.0, "BANKNIFTY": 10.0, "SENSEX": 20.0,
+    "INDIA VIX": 0.1, "CRUDEOIL": 5.0,
+}
+
+try:
+    from zoneinfo import ZoneInfo
+    _IST = ZoneInfo("Asia/Kolkata")
+except Exception:
+    _IST = None
+
+
+def now_ist():
+    """Current time in IST as a naive datetime.
+    Streamlit Cloud servers run on UTC — plain datetime.now() there is
+    5.5 h behind and makes 'live' fetches stop hours in the past."""
+    if _IST is None:
+        return datetime.utcnow() + timedelta(hours=5, minutes=30)
+    return datetime.now(_IST).replace(tzinfo=None)
+
+
+def session_hours(symbol):
+    exch = SYMBOL_TOKEN_MAP[symbol][0]
+    return SESSION_HOURS.get(exch, SESSION_HOURS["NSE"])
+
+
+_MON = {m: i for i, m in enumerate(
+    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+     "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
+
+
+def _resolve_mcx_future(obj, underlying):
+    """Find the near-month MCX futures token for `underlying`
+    (e.g. CRUDEOIL). Returns (token, tradingsymbol). Cached per day."""
+    import re
+    today = now_ist().date()
+    ck = f"mcx_tok|{underlying}|{today}"
+    if ck in st.session_state:
+        return st.session_state[ck]
+
+    candidates = []  # (expiry_date, token, tradingsymbol)
+    # Pattern like CRUDEOIL19DEC25FUT — excludes CRUDEOILM (mini)
+    pat = re.compile(rf"^{underlying}(\d{{2}})([A-Z]{{3}})(\d{{2}})FUT$")
+
+    # 1) SmartAPI searchScrip — light, uses the logged-in session
+    try:
+        resp = obj.searchScrip("MCX", underlying)
+        for row in (resp or {}).get("data") or []:
+            m = pat.match(str(row.get("tradingsymbol", "")).upper())
+            if m:
+                d, mon, yy = m.groups()
+                exp = datetime(2000 + int(yy), _MON[mon], int(d)).date()
+                candidates.append((exp, str(row["symboltoken"]),
+                                   row["tradingsymbol"]))
+    except Exception:
+        pass
+
+    # 2) Fallback: Angel One public scrip master
+    if not candidates:
+        import requests
+        url = ("https://margincalculator.angelbroking.com/OpenAPI_File/"
+               "files/OpenAPIScripMaster.json")
+        rows = requests.get(url, timeout=30).json()
+        for row in rows:
+            if (row.get("exch_seg") == "MCX"
+                    and row.get("name") == underlying
+                    and row.get("instrumenttype") == "FUTCOM"):
+                try:
+                    exp = datetime.strptime(row["expiry"], "%d%b%Y").date()
+                except Exception:
+                    continue
+                candidates.append((exp, str(row["token"]), row["symbol"]))
+
+    live = sorted(c for c in candidates if c[0] >= today)
+    if not live:
+        raise RuntimeError(f"No active MCX {underlying} futures contract found.")
+    _, token, tsym = live[0]
+    st.session_state[ck] = (token, tsym)
+    return token, tsym
+
+
+def resolve_symbol(obj, symbol):
+    """Returns (exchange, token, display_name) for a SYMBOL_TOKEN_MAP key."""
+    exchange, token, _ = SYMBOL_TOKEN_MAP[symbol]
+    if token is None:
+        token, tsym = _resolve_mcx_future(obj, symbol)
+        return exchange, token, tsym
+    return exchange, token, symbol
+
 
 def compute_bollinger_bands(df, period=20):
     df = df.copy()
@@ -1350,8 +1454,8 @@ with tab1:
         symbol_choice = st.selectbox("Symbol", list(SYMBOL_TOKEN_MAP.keys()))
         interval      = st.selectbox("Timeframe", list(INTERVAL_MAP.keys()))
     with col2:
-        from_date = st.date_input("From Date", value=datetime.today() - timedelta(days=7))
-        to_date   = st.date_input("To Date",   value=datetime.today())
+        from_date = st.date_input("From Date", value=now_ist().date() - timedelta(days=7))
+        to_date   = st.date_input("To Date",   value=now_ist().date())
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1364,10 +1468,13 @@ with tab1:
             with st.spinner(f"Fetching {symbol_choice} · {interval}..."):
                 try:
                     obj = st.session_state["smart_obj"]
-                    exchange, token, _ = SYMBOL_TOKEN_MAP[symbol_choice]
+                    exchange, token, disp_name = resolve_symbol(obj, symbol_choice)
+                    if disp_name != symbol_choice:
+                        st.caption(f"Contract: {disp_name} (MCX near-month, token {token})")
 
-                    from_dt = datetime.combine(from_date, datetime.min.time().replace(hour=9, minute=15))
-                    to_dt   = datetime.combine(to_date,   datetime.min.time().replace(hour=15, minute=30))
+                    (oh, om), (ch, cm) = session_hours(symbol_choice)
+                    from_dt = datetime.combine(from_date, datetime.min.time().replace(hour=oh, minute=om))
+                    to_dt   = datetime.combine(to_date,   datetime.min.time().replace(hour=ch, minute=cm))
 
                     historic_params = {
                         "exchange":    exchange,
@@ -1406,7 +1513,7 @@ with tab1:
 
                         # Download CSV
                         csv_bytes = df_raw.to_csv(index=False).encode("utf-8")
-                        fname = f"{symbol_choice}_{interval.replace(' ','_')}_{from_date}_to_{to_date}.csv"
+                        fname = f"{disp_name.replace(' ','_')}_{interval.replace(' ','_')}_{from_date}_to_{to_date}.csv"
                         st.download_button(
                             label="⬇️ DOWNLOAD CSV",
                             data=csv_bytes,
@@ -1761,9 +1868,9 @@ with tab3:
 
     try:
         obj = st.session_state["smart_obj"]
-        exchange, token, _ = SYMBOL_TOKEN_MAP[live_symbol]
+        exchange, token, _ = resolve_symbol(obj, live_symbol)
 
-        to_dt   = datetime.now()
+        to_dt   = now_ist()
         from_dt = to_dt - timedelta(days=int(lookback_days))
 
         # Cache key: tied to symbol/timeframe/lookback so each combo is cached separately
@@ -1795,7 +1902,7 @@ with tab3:
         df_live = df_live.sort_values("datetime").reset_index(drop=True)
 
         last_ts = df_live["datetime"].iloc[-1]
-        now_ts = datetime.now()
+        now_ts = now_ist()
         if hasattr(last_ts, "tz_localize"):
             try:
                 last_ts_display = last_ts.tz_localize(None) if last_ts.tz else last_ts
@@ -1939,7 +2046,7 @@ import string as _mp_string
 _MP_LET = _mp_string.ascii_uppercase + _mp_string.ascii_lowercase
 
 
-def _mp_build_session_profile(day_df, period_min, tick):
+def _mp_build_session_profile(day_df, period_min, tick, sess_hm=(9, 15)):
     """Build a TPO profile for one session's candles.
     Returns dict with poc, va_low, va_high, ib_lo, ib_hi, rows, periods,
     day_hi, day_lo, regime info — or None if too few candles."""
@@ -1948,7 +2055,7 @@ def _mp_build_session_profile(day_df, period_min, tick):
         return None
 
     sess_start = day_df["datetime"].iloc[0].replace(
-        hour=9, minute=15, second=0, microsecond=0)
+        hour=sess_hm[0], minute=sess_hm[1], second=0, microsecond=0)
 
     def _round_tick(p):
         return round(round(p / tick) * tick, 4)
@@ -2113,18 +2220,20 @@ with tab4:
                 help="30 min = classic Dalton. 15 = finer intraday.",
             )
         with c3:
-            default_tick = (10.0 if "BANK" in mp_sym.upper()
-                            else 5.0 if "NIFTY" in mp_sym.upper() else 1.0)
+            default_tick = DEFAULT_TPO_TICK.get(mp_sym, 1.0)
             tick = st.number_input(
                 "Row size (pts)", min_value=0.05,
                 value=float(default_tick), step=0.05,
-                help="~5 NIFTY · ~10 BANKNIFTY · small for option premiums.",
+                help="~5 NIFTY · ~10 BANKNIFTY · ~20 SENSEX · ~0.1 VIX · "
+                     "~5 CRUDEOIL · small for option premiums.",
             )
 
         st.markdown("</div>", unsafe_allow_html=True)
 
         day_df = mp_df[mp_df["datetime"].dt.date == sel_day]
-        prof = _mp_build_session_profile(day_df, period_min, tick)
+        mp_sess_hm = (session_hours(mp_sym)[0]
+                      if mp_sym in SYMBOL_TOKEN_MAP else (9, 15))
+        prof = _mp_build_session_profile(day_df, period_min, tick, mp_sess_hm)
 
         if prof is None:
             st.warning("Not enough candles in this session for a profile.")
@@ -2162,7 +2271,7 @@ with tab4:
                 prev_day = sessions[sel_idx - 1]
                 prev_df = mp_df[mp_df["datetime"].dt.date == prev_day]
                 prev_prof = _mp_build_session_profile(
-                    prev_df, period_min, tick)
+                    prev_df, period_min, tick, mp_sess_hm)
                 if prev_prof is not None:
                     mig = _mp_value_migration(prev_prof, prof)
                     st.markdown(
