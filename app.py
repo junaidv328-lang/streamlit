@@ -439,6 +439,94 @@ def _resolve_mcx_future(obj, underlying):
     return token, tsym
 
 
+# Days per request. One request per day for 1-min / 3-min means a single
+# big request can't come back with part of the range missing.
+CHUNK_DAYS = {
+    "ONE_MINUTE": 1, "THREE_MINUTE": 1, "FIVE_MINUTE": 3,
+    "FIFTEEN_MINUTE": 10, "THIRTY_MINUTE": 20, "ONE_HOUR": 30,
+    "ONE_DAY": 365,
+}
+
+
+def fetch_range_chunked(obj, exchange, token, interval_code,
+                        from_date, to_date, open_hm, close_hm,
+                        progress=None):
+    """Fetch candles from from_date to to_date in small chunks, retrying on
+    rate limits. Returns (df, errors)."""
+    import time as _time
+    step = CHUNK_DAYS.get(interval_code, 5)
+    frames, errors = [], []
+    days = []
+    d = from_date
+    while d <= to_date:
+        days.append(d)
+        d += timedelta(days=step)
+    for i, start in enumerate(days):
+        end = min(start + timedelta(days=step - 1), to_date)
+        params = {
+            "exchange": exchange, "symboltoken": token,
+            "interval": interval_code,
+            "fromdate": datetime.combine(start, datetime.min.time()).replace(
+                hour=open_hm[0], minute=open_hm[1]).strftime("%Y-%m-%d %H:%M"),
+            "todate": datetime.combine(end, datetime.min.time()).replace(
+                hour=close_hm[0], minute=close_hm[1]).strftime("%Y-%m-%d %H:%M"),
+        }
+        resp, last_msg = None, ""
+        for attempt in range(4):
+            if attempt:
+                _time.sleep([1, 2, 4][attempt - 1])
+            try:
+                resp = obj.getCandleData(params)
+            except Exception as e:
+                resp, last_msg = None, str(e)
+                continue
+            if resp and resp.get("status"):
+                break
+            last_msg = str((resp or {}).get("message", ""))
+            if "rate" not in last_msg.lower() and "access" not in last_msg.lower():
+                break
+        if resp and resp.get("status"):
+            if resp.get("data"):
+                frames.append(pd.DataFrame(
+                    resp["data"],
+                    columns=["datetime", "open", "high", "low", "close", "volume"]))
+        else:
+            errors.append(f"{start} → {end}: {last_msg or 'no response'}")
+        if progress is not None:
+            progress.progress((i + 1) / len(days))
+        _time.sleep(0.35)   # SmartAPI historical limit is ~3 requests/sec
+
+    if not frames:
+        return pd.DataFrame(columns=["datetime", "open", "high", "low",
+                                     "close", "volume"]), errors
+    df = pd.concat(frames, ignore_index=True)
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = (df.drop_duplicates(subset="datetime")
+            .sort_values("datetime").reset_index(drop=True))
+    return df, errors
+
+
+def session_coverage(df, open_hm, close_hm, today):
+    """One row per session: first/last candle, count, and whether it looks
+    complete. Flags sessions missing data at the open or the close."""
+    rows = []
+    o_min = open_hm[0] * 60 + open_hm[1]
+    c_min = close_hm[0] * 60 + close_hm[1]
+    for day, g in df.groupby(df["datetime"].dt.date):
+        first, last = g["datetime"].iloc[0], g["datetime"].iloc[-1]
+        f_min = first.hour * 60 + first.minute
+        l_min = last.hour * 60 + last.minute
+        issues = []
+        if f_min > o_min + 15:
+            issues.append("missing open")
+        if day != today and l_min < c_min - 40:
+            issues.append("missing close")
+        rows.append({"session": day, "first": first.strftime("%H:%M"),
+                     "last": last.strftime("%H:%M"), "candles": len(g),
+                     "status": ", ".join(issues) or "ok"})
+    return pd.DataFrame(rows)
+
+
 def resolve_symbol(obj, symbol):
     """Returns (exchange, token, display_name) for a SYMBOL_TOKEN_MAP key."""
     exchange, token, _ = SYMBOL_TOKEN_MAP[symbol]
@@ -1476,23 +1564,34 @@ with tab1:
                     from_dt = datetime.combine(from_date, datetime.min.time().replace(hour=oh, minute=om))
                     to_dt   = datetime.combine(to_date,   datetime.min.time().replace(hour=ch, minute=cm))
 
-                    historic_params = {
-                        "exchange":    exchange,
-                        "symboltoken": token,
-                        "interval":    INTERVAL_MAP[interval],
-                        "fromdate":    from_dt.strftime("%Y-%m-%d %H:%M"),
-                        "todate":      to_dt.strftime("%Y-%m-%d %H:%M"),
-                    }
+                    prog = st.progress(0.0)
+                    df_raw, fetch_errs = fetch_range_chunked(
+                        obj, exchange, token, INTERVAL_MAP[interval],
+                        from_date, to_date, (oh, om), (ch, cm), progress=prog)
+                    prog.empty()
+                    if fetch_errs:
+                        st.warning("Some chunks failed:\n\n" +
+                                   "\n".join(f"- {e}" for e in fetch_errs))
 
-                    hist = obj.getCandleData(historic_params)
+                    hist = {"status": len(df_raw) > 0,
+                            "message": "No candles returned for this range."}
 
                     if not hist.get("status"):
                         st.error(f"Data fetch failed: {hist.get('message')}")
                     else:
-                        raw    = hist["data"]
-                        df_raw = pd.DataFrame(raw, columns=["datetime","open","high","low","close","volume"])
-                        df_raw["datetime"] = pd.to_datetime(df_raw["datetime"])
-                        df_raw = df_raw.sort_values("datetime").reset_index(drop=True)
+                        if interval != "1 day":
+                            cov = session_coverage(df_raw, (oh, om), (ch, cm),
+                                                   now_ist().date())
+                            bad = cov[cov["status"] != "ok"]
+                            if len(bad):
+                                st.warning(
+                                    f"{len(bad)} session(s) have incomplete data "
+                                    "from Angel One: "
+                                    + ", ".join(f"{r.session:%d %b} ({r.status})"
+                                                for r in bad.itertuples()))
+                            with st.expander("Session coverage", expanded=len(bad) > 0):
+                                st.dataframe(cov, use_container_width=True,
+                                             hide_index=True)
 
                         st.session_state["fetched_df"]   = df_raw
                         st.session_state["fetch_symbol"] = symbol_choice
@@ -1790,7 +1889,7 @@ def fetch_candles_cached(
 # ══════════════════════════════════════════════
 # TAB 3 — BROOKS LIVE
 # ══════════════════════════════════════════════
-with tab3:
+def _render_brooks_live():
     st.markdown(
         '<div class="card"><div class="card-title">🎯 BROOKS LIVE SIGNALS — NIFTY 50</div>',
         unsafe_allow_html=True,
@@ -1860,7 +1959,7 @@ with tab3:
 
     if not is_logged_in:
         st.warning("🔑 Login from Tab 1 first — Brooks Live needs SmartAPI access.")
-        st.stop()
+        return
 
     # ── Fetch latest candles (cached + retry) ────
     fetch_placeholder = st.empty()
@@ -1892,7 +1991,7 @@ with tab3:
 
         if not result.get("status"):
             fetch_placeholder.error(f"Fetch failed: {result.get('message')}")
-            st.stop()
+            return
 
         df_live = pd.DataFrame(
             result["data"],
@@ -1929,7 +2028,7 @@ with tab3:
         )
     except Exception as e:
         fetch_placeholder.error(f"Fetch error: {e}")
-        st.stop()
+        return
 
     # ── Run Brooks detection ─────────────────────
     signals = detect_brooks_signals(df_live)
@@ -2041,6 +2140,10 @@ with tab3:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+with tab3:
+    _render_brooks_live()
+
+
 import string as _mp_string
 
 _MP_LET = _mp_string.ascii_uppercase + _mp_string.ascii_lowercase
@@ -2108,6 +2211,10 @@ def _mp_build_session_profile(day_df, period_min, tick, sess_hm=(9, 15)):
 
     n_ib = max(1, 60 // period_min)
     ib_rows = [r for r in period_ranges if _MP_LET.index(r[0]) < n_ib]
+    if not ib_rows:
+        # Session has no candles in its first hour (partial day from the
+        # API) — an initial balance can't be built, so skip it.
+        return None
     ib_lo = min(r[1] for r in ib_rows)
     ib_hi = max(r[2] for r in ib_rows)
     ib_range = ib_hi - ib_lo
@@ -2236,7 +2343,7 @@ with tab4:
         prof = _mp_build_session_profile(day_df, period_min, tick, mp_sess_hm)
 
         if prof is None:
-            st.warning("Not enough candles in this session for a profile.")
+            st.warning("This session is incomplete (needs its first hour of candles and at least 10 bars). Check Session coverage in Tab 1, or pick another day.")
         else:
             # ── Structure cards ───────────────────────────────────────
             st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -2267,11 +2374,30 @@ with tab4:
 
             # ── Day-over-day VALUE MIGRATION ──────────────────────────
             sel_idx = sessions.index(sel_day)
+            # Walk back to the nearest earlier session with usable data
+            prev_day, prev_prof, skipped = None, None, []
+            for j in range(sel_idx - 1, -1, -1):
+                cand = sessions[j]
+                cand_prof = _mp_build_session_profile(
+                    mp_df[mp_df["datetime"].dt.date == cand],
+                    period_min, tick, mp_sess_hm)
+                if cand_prof is not None:
+                    prev_day, prev_prof = cand, cand_prof
+                    break
+                skipped.append(cand.strftime("%d %b"))
+            if skipped:
+                st.caption("Skipped incomplete session(s) for comparison: "
+                           + ", ".join(skipped))
+            if sel_idx > 0 and prev_prof is None:
+                st.markdown(
+                    "<div class='card'><div style='font-size:0.75rem; "
+                    "color:#94a3b8; font-family:\"JetBrains Mono\","
+                    "monospace; letter-spacing:1px;'>VALUE MIGRATION — "
+                    "earlier sessions are incomplete. Re-fetch the range "
+                    "in Tab 1.</div></div>",
+                    unsafe_allow_html=True,
+                )
             if sel_idx > 0:
-                prev_day = sessions[sel_idx - 1]
-                prev_df = mp_df[mp_df["datetime"].dt.date == prev_day]
-                prev_prof = _mp_build_session_profile(
-                    prev_df, period_min, tick, mp_sess_hm)
                 if prev_prof is not None:
                     mig = _mp_value_migration(prev_prof, prof)
                     st.markdown(
