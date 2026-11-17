@@ -439,12 +439,13 @@ def _resolve_mcx_future(obj, underlying):
     return token, tsym
 
 
-# Days per request. One request per day for 1-min / 3-min means a single
-# big request can't come back with part of the range missing.
+# Calendar days per request — about 2,000 NSE candles each, well inside
+# Angel One's per-request limits. MCX sessions are ~2.4x longer, so MCX
+# requests use half these spans.
 CHUNK_DAYS = {
-    "ONE_MINUTE": 1, "THREE_MINUTE": 1, "FIVE_MINUTE": 3,
-    "FIFTEEN_MINUTE": 10, "THIRTY_MINUTE": 20, "ONE_HOUR": 30,
-    "ONE_DAY": 365,
+    "ONE_MINUTE": 5, "THREE_MINUTE": 15, "FIVE_MINUTE": 25,
+    "FIFTEEN_MINUTE": 75, "THIRTY_MINUTE": 150, "ONE_HOUR": 300,
+    "ONE_DAY": 1800,
 }
 
 
@@ -455,6 +456,8 @@ def fetch_range_chunked(obj, exchange, token, interval_code,
     rate limits. Returns (df, errors)."""
     import time as _time
     step = CHUNK_DAYS.get(interval_code, 5)
+    if exchange == "MCX":
+        step = max(1, step // 2)
     frames, errors = [], []
     days = []
     d = from_date
@@ -493,7 +496,10 @@ def fetch_range_chunked(obj, exchange, token, interval_code,
         else:
             errors.append(f"{start} → {end}: {last_msg or 'no response'}")
         if progress is not None:
-            progress.progress((i + 1) / len(days))
+            n_rows = sum(len(f) for f in frames)
+            progress.progress((i + 1) / len(days),
+                              text=f"Chunk {i + 1}/{len(days)} · "
+                                   f"{n_rows:,} candles so far")
         _time.sleep(0.35)   # SmartAPI historical limit is ~3 requests/sec
 
     if not frames:
@@ -1547,6 +1553,13 @@ with tab1:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
+    if st.session_state.get("live_refresh_interval", "Off") != "Off":
+        st.warning(
+            "Brooks Live auto-refresh is ON — it restarts the app every "
+            f"{st.session_state['live_refresh_interval']} and will cancel a "
+            "long fetch. Set Refresh to Off in the Brooks Live tab before "
+            "fetching a big date range.")
+
     if st.button("⚡ FETCH OHLC DATA", disabled=not is_logged_in):
         if not is_logged_in:
             st.warning("Login first using the LOGIN button above.")
@@ -1587,8 +1600,10 @@ with tab1:
                                 st.warning(
                                     f"{len(bad)} session(s) have incomplete data "
                                     "from Angel One: "
-                                    + ", ".join(f"{r.session:%d %b} ({r.status})"
-                                                for r in bad.itertuples()))
+                                    + ", ".join(f"{r.session:%d %b %Y} ({r.status})"
+                                                for r in bad.head(10).itertuples())
+                                    + (f" … and {len(bad) - 10} more — see the table."
+                                       if len(bad) > 10 else ""))
                             with st.expander("Session coverage", expanded=len(bad) > 0):
                                 st.dataframe(cov, use_container_width=True,
                                              hide_index=True)
@@ -1673,6 +1688,14 @@ with tab2:
             st.markdown(f'<span class="badge badge-green">✓ {len(df_chart)} candles loaded</span>', unsafe_allow_html=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
+
+    if df_chart is not None and len(df_chart) > 1500:
+        show_n = st.number_input(
+            f"Candles to chart (of {len(df_chart):,})", min_value=100,
+            max_value=len(df_chart), value=500, step=100,
+            help="Drawing tens of thousands of candles freezes the browser. "
+                 "The full data is still in the CSV and the other tabs.")
+        df_chart = df_chart.tail(int(show_n) + 50).reset_index(drop=True)
 
     if df_chart is not None and len(df_chart) >= 20:
 
@@ -1924,7 +1947,8 @@ def _render_brooks_live():
         refresh_interval = st.selectbox(
             "Refresh",
             ["Off", "60s", "90s", "120s", "300s"],
-            index=1,  # default 60s
+            index=0,  # default Off — a refresh restarts the whole app,
+                      # which would cancel a long fetch running in Tab 1
             key="live_refresh_interval",
             help="How often the app re-fetches data from SmartAPI. Cached results may still be reused.",
         )
